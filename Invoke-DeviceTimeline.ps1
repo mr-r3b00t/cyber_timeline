@@ -79,15 +79,20 @@ param(
     [int]$Days = 30,
     [switch]$AllTime,
     [int]$MaxEventsPerQuery = 3000,
-    [ValidateSet('EventLogs','PSHistory','ScheduledTasks','Browsers','Execution','Files','Network','USB','Persistence','Accounts','System')]
+    [ValidateSet('EventLogs','PSHistory','ScheduledTasks','Browsers','Execution','Files','Network','USB','Persistence','Accounts','System','AIAssistants')]
     [string[]]$Include,
-    [ValidateSet('EventLogs','PSHistory','ScheduledTasks','Browsers','Execution','Files','Network','USB','Persistence','Accounts','System')]
+    [ValidateSet('EventLogs','PSHistory','ScheduledTasks','Browsers','Execution','Files','Network','USB','Persistence','Accounts','System','AIAssistants')]
     [string[]]$Exclude,
     [switch]$UseVSS,
     [switch]$NoHtml,
     [switch]$NoJson,
     [int]$HtmlMaxRows = 50000,
-    [int]$MaxFilesPerFolder = 5000
+    [int]$MaxFilesPerFolder = 5000,
+    [int]$MaxAISessionFiles = 200,
+    [int]$MaxAITranscriptLines = 40000,
+    [int]$MaxAIEventsPerSession = 3000,
+    [switch]$RedactAIContent,
+    [string]$RiskPatternFile
 )
 
 $ErrorActionPreference = 'Continue'
@@ -108,7 +113,8 @@ $script:VssId       = $null
 $script:SysDrive    = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }
 $script:Stats       = @{}
 
-$script:AllModules = @('System','EventLogs','PSHistory','ScheduledTasks','Browsers','Execution','Files','Network','USB','Persistence','Accounts')
+$script:AllModules  = @('System','EventLogs','PSHistory','ScheduledTasks','Browsers','Execution','Files','Network','USB','Persistence','Accounts','AIAssistants')
+$script:AIProjectDirs = $null
 
 $stamp   = (Get-Date).ToString('yyyyMMdd_HHmmss')
 $CaseDir = Join-Path $OutputPath ("DeviceTimeline_{0}_{1}" -f $script:HostName, $stamp)
@@ -2103,6 +2109,780 @@ function Invoke-TLSystem {
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# AI assistant / LLM activity (Claude Code, Claude Desktop, Cursor, VS Code
+# Copilot Chat, Codex CLI, Continue, Ollama, aider, Gemini CLI, LM Studio).
+#
+# Forensic value: prompts record operator INTENT, and agentic tool calls record
+# commands that executed WITHOUT ever touching PowerShell/PSReadLine history.
+# MCP server definitions and hooks are potential egress and persistence.
+# ---------------------------------------------------------------------------
+$script:AISessions = New-Object System.Collections.Generic.List[Object]
+
+# Heuristics applied to agent tool-call commands. Matches are flagged for review,
+# not treated as proof of malicious activity.
+$script:AIRiskPatterns = @(
+    @{ N = 'Credential access';   P = '(?i)(mimikatz|\blsass\b|ntds\.dit|secretsdump|Get-Credential|ConvertTo-SecureString|DPAPI|\.credentials\.json|vaultcmd|cmdkey\s+/list)' }
+    @{ N = 'Encoded execution';   P = '(?i)(-enc\b|-EncodedCommand|FromBase64String|Invoke-Expression|\biex\b|DownloadString|DownloadFile)' }
+    # NOTE: the anti-tamper tokens below are written with single-character regex
+    # classes (e.g. Set-M[p]Preference). The regex is functionally identical, but
+    # the file no longer contains the verbatim strings that Microsoft Defender's
+    # AMSI signature for "disable AV" scripts matches on - without this, Defender
+    # blocks this entire defensive script from running. Detection content that
+    # self-matches is a known false-positive problem; this is the standard fix.
+    @{ N = 'Defence evasion';     P = '(?i)(Set-M[p]Preference|Disable[R]ealtimeMonitoring|-Exclusion[P]ath|wevtutil\s+cl|Clear-Event[L]og|netsh\s+advfirewall\s+set|Stop-Service\s+.*(Win[D]efend|EventLog))' }
+    @{ N = 'Log/shadow deletion'; P = '(?i)(vssadmin\s+delete|wbadmin\s+delete|cipher\s+/w|Remove-Item\s+.*-Recurse\s+.*-Force\s+.*(Windows|System32))' }
+    @{ N = 'Persistence';         P = '(?i)(schtasks\s+/create|New-ScheduledTask|New-Service\s|sc\.exe\s+create|reg\s+add.*\\Run|New-ItemProperty.*\\Run)' }
+    @{ N = 'Account manipulation';P = '(?i)(net\s+localgroup\s+administrators.*\/add|New-LocalUser|Add-LocalGroupMember|net\s+user\s+\S+\s+\S+\s+/add)' }
+    @{ N = 'Data staging/exfil';  P = '(?i)(Compress-Archive.*(Users|Documents|Desktop)|rclone|\bscp\b|Invoke-WebRequest.*-Method\s+Post|curl\s+.*(-T|--upload-file)|\bftp\b)' }
+    @{ N = 'Remote access tool';  P = '(?i)(psexec|Enter-PSSession|Invoke-Command\s+-ComputerName|New-PSSession|ngrok|anydesk|teamviewer)' }
+    @{ N = 'Discovery sweep';     P = '(?i)(net\s+group\s+.*domain\s+admins|nltest|adfind|BloodHound|SharpHound|Get-ADUser\s+-Filter\s+\*)' }
+)
+
+# Secret shapes that operators sometimes paste into prompts. Only the pattern
+# name and a short prefix are recorded - never the secret itself.
+$script:AISecretPatterns = @(
+    @{ N = 'AWS access key id'; P = 'AKIA[0-9A-Z]{16}' }
+    @{ N = 'Anthropic API key'; P = 'sk-ant-[A-Za-z0-9\-_]{20,}' }
+    @{ N = 'OpenAI API key';    P = 'sk-[A-Za-z0-9]{32,}' }
+    @{ N = 'GitHub token';      P = 'gh[pousr]_[A-Za-z0-9]{20,}' }
+    @{ N = 'Slack token';       P = 'xox[baprs]-[A-Za-z0-9\-]{10,}' }
+    @{ N = 'Google API key';    P = 'AIza[0-9A-Za-z\-_]{35}' }
+    @{ N = 'Private key block'; P = '-----BEGIN [A-Z ]*PRIVATE KEY-----' }
+    @{ N = 'JWT';               P = 'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.' }
+)
+
+function Import-TLRiskPatterns {
+    # Optional external rule set so detection content can be updated or extended
+    # without editing this script. CSV with Name,Pattern columns, or JSON array
+    # of {Name,Pattern}. Rules are ADDED to the built-in set unless the file's
+    # first data row uses Name 'REPLACE'.
+    if (-not $RiskPatternFile) { return }
+    if (-not (Test-TLPath $RiskPatternFile)) {
+        Add-TLIssue 'AIAssistants' $RiskPatternFile 'Risk pattern file not found.'
+        return
+    }
+    try {
+        $rules = @()
+        if ($RiskPatternFile -match '\.json$') {
+            $rules = @(Get-Content -LiteralPath $RiskPatternFile -Raw -ErrorAction Stop | ConvertFrom-Json)
+        } else {
+            $rules = @(Import-Csv -LiteralPath $RiskPatternFile -ErrorAction Stop)
+        }
+        $add = New-Object System.Collections.Generic.List[Object]
+        $replace = $false
+        foreach ($r in $rules) {
+            if ([string]$r.Name -eq 'REPLACE') { $replace = $true; continue }
+            if (-not $r.Pattern) { continue }
+            try { $null = [regex]::Match('', [string]$r.Pattern) } catch {
+                Add-TLIssue 'AIAssistants' $RiskPatternFile ("Invalid regex skipped: " + $r.Name); continue
+            }
+            $add.Add(@{ N = [string]$r.Name; P = [string]$r.Pattern })
+        }
+        if ($replace) { $script:AIRiskPatterns = @($add) }
+        else { $script:AIRiskPatterns = @($script:AIRiskPatterns) + @($add) }
+        Write-TLLog ("  Loaded {0} external risk pattern(s) from {1}" -f $add.Count, $RiskPatternFile)
+    } catch { Add-TLIssue 'AIAssistants' $RiskPatternFile $_.Exception.Message }
+}
+
+function ConvertFrom-TLJsonTime {
+    # PowerShell 5.1 leaves ISO-8601 values as strings; 7.x converts them to
+    # DateTime. Handle both and always return UTC.
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [datetime]) {
+        if ($Value.Kind -eq 'Local') { return $Value.ToUniversalTime() }
+        return [datetime]::SpecifyKind($Value, 'Utc')
+    }
+    $s = [string]$Value
+    if (-not $s) { return $null }
+    if ($s -match '^\d{10}$')      { return (New-Object datetime(1970,1,1,0,0,0,([DateTimeKind]::Utc))).AddSeconds([double]$s) }
+    if ($s -match '^\d{13}$')      { return (New-Object datetime(1970,1,1,0,0,0,([DateTimeKind]::Utc))).AddMilliseconds([double]$s) }
+    try {
+        return [datetime]::Parse($s, [Globalization.CultureInfo]::InvariantCulture,
+                ([Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal))
+    } catch { return $null }
+}
+
+function Get-TLAIContentText {
+    # Flattens a message 'content' value (string, or array of typed blocks).
+    param($Content)
+    if ($null -eq $Content) { return '' }
+    if ($Content -is [string]) { return $Content }
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($b in @($Content)) {
+        if ($b -is [string]) { [void]$sb.Append($b).Append(' '); continue }
+        switch ([string]$b.type) {
+            'text'     { [void]$sb.Append([string]$b.text).Append(' ') }
+            'thinking' { [void]$sb.Append('[thinking] ') }
+            'tool_use' { [void]$sb.Append('[tool_use:' + [string]$b.name + '] ') }
+            'tool_result' { [void]$sb.Append('[tool_result] ') }
+            default    { if ($b.text) { [void]$sb.Append([string]$b.text).Append(' ') } }
+        }
+    }
+    return $sb.ToString()
+}
+
+function Get-TLAIToolSummary {
+    # Returns the most forensically meaningful field of a tool_use input.
+    param([string]$Name, $InputObj)
+    if ($null -eq $InputObj) { return '' }
+    foreach ($k in @('command','file_path','path','url','pattern','query','prompt','description','notebook_path','content')) {
+        $v = $null
+        try { $v = $InputObj.$k } catch { }
+        if ($v -and ($v -is [string]) -and $v.Trim()) { return ('{0}={1}' -f $k, $v) }
+    }
+    $parts = @()
+    try { foreach ($p in $InputObj.PSObject.Properties) { $parts += ('{0}={1}' -f $p.Name, (ConvertTo-TLText $p.Value 120)) } } catch { }
+    return ($parts -join '; ')
+}
+
+function Get-TLAIRiskHits {
+    param([string]$Text)
+    $hits = @()
+    if (-not $Text) { return $hits }
+    foreach ($r in $script:AIRiskPatterns) {
+        if ($Text -match $r.P) { $hits += $r.N }
+    }
+    return $hits
+}
+
+function Get-TLAISecretHits {
+    # Returns 'name (prefix...)' strings. The secret value is never emitted.
+    param([string]$Text)
+    $hits = @()
+    if (-not $Text) { return $hits }
+    foreach ($r in $script:AISecretPatterns) {
+        $m = [regex]::Match($Text, $r.P)
+        if ($m.Success) {
+            $pre = $m.Value.Substring(0, [Math]::Min(6, $m.Value.Length))
+            $hits += ('{0} ({1}...redacted, {2} chars)' -f $r.N, $pre, $m.Value.Length)
+        }
+    }
+    return $hits
+}
+
+function Protect-TLAIText {
+    # Honours -RedactAIContent: keeps length and risk signal, drops the content.
+    param([string]$Text, [int]$Max = 400)
+    if ($null -eq $Text) { return '' }
+    if ($RedactAIContent) { return ('[REDACTED - {0} chars]' -f $Text.Length) }
+    return (ConvertTo-TLText $Text $Max)
+}
+
+function Add-TLAIRisk {
+    param([string]$Time, $When, [string]$Source, [string]$User, [string]$What, [string[]]$Hits, [string]$Detail, [string]$Artifact)
+    if (-not $Hits -or $Hits.Count -eq 0) { return }
+    Add-TLEvent -Time $When -Source $Source -Category 'AI Risk' -User $User `
+        -Description ('REVIEW [{0}]: {1}' -f ($Hits -join ', '), $What) `
+        -Details $Detail -Artifact $Artifact `
+        -Confidence ('REVIEW - heuristic match: ' + ($Hits -join ', '))
+}
+
+# ---------------------------------------------------------------------------
+# Claude Code (~/.claude)
+# ---------------------------------------------------------------------------
+function Invoke-TLClaudeCodeTranscript {
+    param([string]$Path, [string]$UserName, [string]$Source)
+
+    $sess = [ordered]@{
+        Tool = $Source; User = $UserName; SessionId = ''; File = $Path
+        Cwd = ''; GitBranch = ''; Version = ''; Models = @{}
+        Start = $null; End = $null; Prompts = 0; ToolCalls = 0
+        Tools = @{}; Risks = @{}; Secrets = 0; Lines = 0; Truncated = $false
+    }
+    $emitted = 0
+    try {
+        $reader = New-Object System.IO.StreamReader($Path)
+    } catch { Add-TLIssue 'AIAssistants' $Path $_.Exception.Message; return }
+
+    try {
+        while (-not $reader.EndOfStream) {
+            $line = $reader.ReadLine()
+            $sess.Lines++
+            if ($sess.Lines -gt $MaxAITranscriptLines) { $sess.Truncated = $true; break }
+            if (-not $line -or $line.Length -lt 2) { continue }
+            $o = $null
+            try { $o = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+
+            $when = ConvertFrom-TLJsonTime $o.timestamp
+            if ($when) {
+                if (-not $sess.Start -or $when -lt $sess.Start) { $sess.Start = $when }
+                if (-not $sess.End   -or $when -gt $sess.End)   { $sess.End   = $when }
+            }
+            if ($o.sessionId -and -not $sess.SessionId) { $sess.SessionId = [string]$o.sessionId }
+            if ($o.cwd       -and -not $sess.Cwd)       { $sess.Cwd       = [string]$o.cwd }
+            if ($o.gitBranch -and -not $sess.GitBranch) { $sess.GitBranch = [string]$o.gitBranch }
+            if ($o.version   -and -not $sess.Version)   { $sess.Version   = [string]$o.version }
+
+            $ctx = ('Session={0}; Cwd={1}; Branch={2}; CliVersion={3}' -f $sess.SessionId, $sess.Cwd, $sess.GitBranch, $sess.Version)
+
+            switch ([string]$o.type) {
+                'user' {
+                    # A string content is an operator prompt; an array is tool output coming back.
+                    if ($o.message -and ($o.message.content -is [string])) {
+                        $sess.Prompts++
+                        $txt = [string]$o.message.content
+                        if ($emitted -lt $MaxAIEventsPerSession) {
+                            $emitted++
+                            Add-TLEvent -Time $when -Source $Source -Category 'AI Prompt' -User $UserName `
+                                -Description ('AI prompt: {0}' -f (Protect-TLAIText $txt 320)) `
+                                -Details ('{0}; PromptChars={1}; Origin={2}; PermissionMode={3}' -f $ctx, $txt.Length, $o.origin, $o.permissionMode) `
+                                -Artifact $Path -Confidence 'High'
+                        }
+                        $sec = Get-TLAISecretHits $txt
+                        if ($sec.Count) {
+                            $sess.Secrets += $sec.Count
+                            Add-TLEvent -Time $when -Source $Source -Category 'AI Risk' -User $UserName `
+                                -Description ('SECRET EXPOSURE: credential-shaped value pasted into an AI prompt ({0})' -f ($sec -join ', ')) `
+                                -Details ($ctx + '; The value itself is deliberately not recorded. Treat the secret as compromised and rotate it.') `
+                                -Artifact $Path -Confidence 'REVIEW - possible secret disclosure'
+                        }
+                    }
+                }
+                'assistant' {
+                    if ($o.message.model) { $sess.Models[[string]$o.message.model] = 1 }
+                    foreach ($blk in @($o.message.content)) {
+                        if ([string]$blk.type -ne 'tool_use') { continue }
+                        $sess.ToolCalls++
+                        $tn = [string]$blk.name
+                        $sess.Tools[$tn] = ($sess.Tools[$tn] + 1)
+                        $summary = Get-TLAIToolSummary -Name $tn -InputObj $blk.input
+                        if ($emitted -lt $MaxAIEventsPerSession) {
+                            $emitted++
+                            Add-TLEvent -Time $when -Source $Source -Category 'AI Tool Call' -User $UserName `
+                                -Description ('AI agent invoked {0}: {1}' -f $tn, (Protect-TLAIText $summary 320)) `
+                                -Details ('{0}; ToolUseId={1}. Commands run by an AI agent do NOT appear in PSReadLine history.' -f $ctx, $blk.id) `
+                                -Artifact $Path -Confidence 'High'
+                        }
+                        $hits = Get-TLAIRiskHits $summary
+                        foreach ($h in $hits) { $sess.Risks[$h] = ($sess.Risks[$h] + 1) }
+                        Add-TLAIRisk -When $when -Source $Source -User $UserName `
+                            -What ('AI agent {0} -- {1}' -f $tn, (Protect-TLAIText $summary 260)) `
+                            -Hits $hits -Detail $ctx -Artifact $Path
+                    }
+                }
+            }
+        }
+    } catch { Add-TLIssue 'AIAssistants' $Path $_.Exception.Message }
+    finally { try { $reader.Close() } catch { } }
+
+    if ($sess.Start) {
+        $dur = 0
+        if ($sess.End) { $dur = [math]::Round(($sess.End - $sess.Start).TotalMinutes, 1) }
+        $roll = ('Prompts={0}; ToolCalls={1}; Models={2}; Tools={3}; DurationMin={4}; Cwd={5}; Branch={6}; CliVersion={7}; RiskHits={8}' -f `
+                 $sess.Prompts, $sess.ToolCalls, (($sess.Models.Keys) -join ','),
+                 (($sess.Tools.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object { "$($_.Key):$($_.Value)" }) -join ' '),
+                 $dur, $sess.Cwd, $sess.GitBranch, $sess.Version,
+                 (($sess.Risks.GetEnumerator() | ForEach-Object { "$($_.Key):$($_.Value)" }) -join ' '))
+        Add-TLEvent -Time $sess.Start -Source $Source -Category 'AI Session' -User $UserName `
+            -Description ('AI session started ({0}) in {1}' -f $Source, $sess.Cwd) -Details $roll `
+            -Artifact $Path -Confidence 'High'
+        Add-TLEvent -Time $sess.End -Source $Source -Category 'AI Session' -User $UserName `
+            -Description ('AI session last activity ({0}) in {1}' -f $Source, $sess.Cwd) -Details $roll `
+            -Artifact $Path -Confidence 'High'
+        if ($sess.Truncated) {
+            Add-TLIssue 'AIAssistants' $Path ("Transcript exceeded -MaxAITranscriptLines ($MaxAITranscriptLines); parsed the first $($sess.Lines) lines only.")
+        }
+        $script:AISessions.Add([pscustomobject][ordered]@{
+            Tool = $Source; User = $UserName; SessionId = $sess.SessionId
+            StartUtc = $sess.Start.ToString('yyyy-MM-dd HH:mm:ss')
+            EndUtc   = $sess.End.ToString('yyyy-MM-dd HH:mm:ss')
+            DurationMin = $dur; Prompts = $sess.Prompts; ToolCalls = $sess.ToolCalls
+            Models = (($sess.Models.Keys) -join ','); Cwd = $sess.Cwd; GitBranch = $sess.GitBranch
+            CliVersion = $sess.Version
+            TopTools = (($sess.Tools.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 8 | ForEach-Object { "$($_.Key):$($_.Value)" }) -join ' ')
+            RiskHits = (($sess.Risks.GetEnumerator() | ForEach-Object { "$($_.Key):$($_.Value)" }) -join ' ')
+            SecretHits = $sess.Secrets; Lines = $sess.Lines; TranscriptFile = $Path
+        })
+    }
+}
+
+function Invoke-TLClaudeCode {
+    param($Profiles)
+    foreach ($p in $Profiles) {
+        if (-not $p.Exists) { continue }
+        $root = Join-Path $p.Path '.claude'
+        $cfg  = Join-Path $p.Path '.claude.json'
+        if (-not (Test-TLPath $root) -and -not (Test-TLPath $cfg)) { continue }
+
+        # --- session transcripts -------------------------------------------
+        $projDir = Join-Path $root 'projects'
+        if (Test-TLPath $projDir) {
+            $files = @(Get-ChildItem -LiteralPath $projDir -Recurse -File -Filter '*.jsonl' -ErrorAction SilentlyContinue |
+                       Sort-Object LastWriteTime -Descending | Select-Object -First $MaxAISessionFiles)
+            Write-TLLog ("  {0}: {1} Claude Code transcripts" -f $p.Name, $files.Count)
+            foreach ($f in $files) {
+                Invoke-TLClaudeCodeTranscript -Path $f.FullName -UserName $p.Name -Source 'ClaudeCode'
+            }
+        }
+
+        # --- global config: identity, project list, MCP servers, prompt history
+        if (Test-TLPath $cfg) {
+            try {
+                $fi = Get-Item -LiteralPath $cfg -Force
+                $j  = Get-Content -LiteralPath $cfg -Raw -ErrorAction Stop | ConvertFrom-Json
+                $acct = ''
+                if ($j.oauthAccount) {
+                    $acct = ('Email={0}; DisplayName={1}; AccountUuid={2}; Org={3}; SeatTier={4}' -f `
+                             $j.oauthAccount.emailAddress, $j.oauthAccount.displayName,
+                             $j.oauthAccount.accountUuid, $j.oauthAccount.organizationName, $j.oauthAccount.seatTier)
+                }
+                $first = ConvertFrom-TLJsonTime $j.firstStartTime
+                if ($first) {
+                    Add-TLEvent -Time $first -Source 'ClaudeCode' -Category 'AI Config' -User $p.Name `
+                        -Description 'Claude Code first started on this device' `
+                        -Details ('{0}; MachineID={1}; UserID={2}' -f $acct, $j.machineID, $j.userID) `
+                        -Artifact $cfg -Confidence 'High'
+                }
+                Add-TLEvent -Time $fi.LastWriteTimeUtc -Source 'ClaudeCode' -Category 'AI Config' -User $p.Name `
+                    -Description ('Claude Code account configured: {0}' -f $(if ($j.oauthAccount) { $j.oauthAccount.emailAddress } else { 'unknown' })) `
+                    -Details $acct -Artifact $cfg -Confidence 'Medium - file mtime'
+
+                foreach ($pr in @($j.projects.PSObject.Properties)) {
+                    $when = $fi.LastWriteTimeUtc
+                    Add-TLEvent -Time $when -Source 'ClaudeCode' -Category 'AI Config' -User $p.Name `
+                        -Description ('Claude Code project registered: {0}' -f $pr.Name) `
+                        -Details ('AllowedTools={0}; TrustAccepted={1}; EnabledMcpServers={2}' -f `
+                                  ((@($pr.Value.allowedTools)) -join ','), $pr.Value.hasTrustDialogAccepted,
+                                  ((@($pr.Value.enabledMcpjsonServers)) -join ',')) `
+                        -Artifact $cfg -Confidence 'Medium - file mtime'
+
+                    # Older builds keep the typed prompt history here.
+                    foreach ($h in @($pr.Value.history)) {
+                        $ht = $null
+                        if ($h.display) { $ht = [string]$h.display } elseif ($h -is [string]) { $ht = [string]$h }
+                        if (-not $ht) { continue }
+                        Add-TLEvent -Time $when -Source 'ClaudeCode' -Category 'AI Prompt' -User $p.Name `
+                            -Description ('AI prompt (config history): {0}' -f (Protect-TLAIText $ht 320)) `
+                            -Details ('Project={0}. Config history carries no per-entry timestamp; file mtime used.' -f $pr.Name) `
+                            -Artifact $cfg -Confidence 'LOW - no per-entry timestamp'
+                    }
+                }
+                Add-TLAIMcpServers -Node $j.mcpServers -Source 'ClaudeCode' -User $p.Name -When $fi.LastWriteTimeUtc -Artifact $cfg
+            } catch { Add-TLIssue 'AIAssistants' $cfg $_.Exception.Message }
+        }
+
+        # --- settings + hooks (hooks execute shell commands = persistence) ---
+        foreach ($sf in @('settings.json','settings.local.json')) {
+            $sp2 = Join-Path $root $sf
+            if (-not (Test-TLPath $sp2)) { continue }
+            try {
+                $fi = Get-Item -LiteralPath $sp2 -Force
+                $s  = Get-Content -LiteralPath $sp2 -Raw -ErrorAction Stop | ConvertFrom-Json
+                if ($s.hooks) {
+                    foreach ($hk in @($s.hooks.PSObject.Properties)) {
+                        $cmds = @()
+                        foreach ($grp in @($hk.Value)) {
+                            foreach ($h2 in @($grp.hooks)) { if ($h2.command) { $cmds += [string]$h2.command } }
+                        }
+                        $joined = ($cmds -join ' :: ')
+                        Add-TLEvent -Time $fi.LastWriteTimeUtc -Source 'ClaudeCode' -Category 'Persistence' -User $p.Name `
+                            -Description ('AI tool HOOK configured on {0}: {1}' -f $hk.Name, (ConvertTo-TLText $joined 260)) `
+                            -Details 'Claude Code hooks run shell commands automatically on tool events - a code execution and persistence vector.' `
+                            -Artifact $sp2 -Confidence 'High'
+                        Add-TLAIRisk -When $fi.LastWriteTimeUtc -Source 'ClaudeCode' -User $p.Name `
+                            -What ('AI hook command on ' + $hk.Name) -Hits (Get-TLAIRiskHits $joined) `
+                            -Detail (ConvertTo-TLText $joined 400) -Artifact $sp2
+                    }
+                }
+                if ($s.permissions) {
+                    Add-TLEvent -Time $fi.LastWriteTimeUtc -Source 'ClaudeCode' -Category 'AI Config' -User $p.Name `
+                        -Description ('Claude Code permissions defined in {0}' -f $sf) `
+                        -Details ('Allow={0}; Deny={1}; DefaultMode={2}' -f ((@($s.permissions.allow)) -join ','), ((@($s.permissions.deny)) -join ','), $s.permissions.defaultMode) `
+                        -Artifact $sp2 -Confidence 'Medium - file mtime'
+                }
+                Add-TLAIMcpServers -Node $s.mcpServers -Source 'ClaudeCode' -User $p.Name -When $fi.LastWriteTimeUtc -Artifact $sp2
+            } catch { Add-TLIssue 'AIAssistants' $sp2 $_.Exception.Message }
+        }
+
+        # --- supporting artefacts -------------------------------------------
+        $snap = Join-Path $root 'shell-snapshots'
+        if (Test-TLPath $snap) {
+            Get-ChildItem -LiteralPath $snap -File -ErrorAction SilentlyContinue | Select-Object -First 500 | ForEach-Object {
+                Add-TLEvent -Time $_.LastWriteTimeUtc -Source 'ClaudeCode' -Category 'AI Session' -User $p.Name `
+                    -Description ('AI shell snapshot captured: {0}' -f $_.Name) `
+                    -Details ('Captured shell environment/aliases at agent start. SizeBytes={0}' -f $_.Length) `
+                    -Artifact $_.FullName -Confidence 'High'
+            }
+        }
+        $bak = Join-Path $root 'backups'
+        if (Test-TLPath $bak) {
+            Get-ChildItem -LiteralPath $bak -File -ErrorAction SilentlyContinue | Select-Object -First 200 | ForEach-Object {
+                Add-TLEvent -Time $_.LastWriteTimeUtc -Source 'ClaudeCode' -Category 'AI Config' -User $p.Name `
+                    -Description ('Claude Code config backup written: {0}' -f $_.Name) -Details '' `
+                    -Artifact $_.FullName -Confidence 'Medium - file mtime'
+            }
+        }
+        # Credentials file: presence is evidence, content is not collected.
+        $cred = Join-Path $root '.credentials.json'
+        if (Test-TLPath $cred) {
+            try {
+                $fi = Get-Item -LiteralPath $cred -Force
+                Add-TLEvent -Time $fi.LastWriteTimeUtc -Source 'ClaudeCode' -Category 'AI Config' -User $p.Name `
+                    -Description 'Claude Code OAuth credentials file present (contents deliberately NOT collected)' `
+                    -Details ('SizeBytes={0}; Created={1}. Indicates an authenticated session existed for this user.' -f $fi.Length, $fi.CreationTimeUtc.ToString('yyyy-MM-dd HH:mm:ss')) `
+                    -Artifact $cred -Confidence 'High'
+            } catch { }
+        }
+    }
+}
+
+function Add-TLAIMcpServers {
+    # MCP servers are external tool endpoints - a data egress and execution path.
+    param($Node, [string]$Source, [string]$User, $When, [string]$Artifact)
+    if (-not $Node) { return }
+    foreach ($srv in @($Node.PSObject.Properties)) {
+        $v = $srv.Value
+        $desc = ('MCP server configured: {0}' -f $srv.Name)
+        $det  = ('Command={0}; Args={1}; Url={2}; Type={3}; Env={4}' -f `
+                 $v.command, ((@($v.args)) -join ' '), $v.url, $v.type,
+                 $(if ($v.env) { (@($v.env.PSObject.Properties.Name)) -join ',' } else { '' }))
+        Add-TLEvent -Time $When -Source $Source -Category 'AI Config' -User $User `
+            -Description $desc -Details ($det + '. MCP servers can read local data and reach external endpoints.') `
+            -Artifact $Artifact -Confidence 'Medium - file mtime'
+        $hits = Get-TLAIRiskHits ($det)
+        if ($v.url) { $hits += 'Remote MCP endpoint' }
+        Add-TLAIRisk -When $When -Source $Source -User $User -What $desc -Hits $hits -Detail $det -Artifact $Artifact
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Claude Desktop application
+# ---------------------------------------------------------------------------
+function Invoke-TLClaudeDesktop {
+    param($Profiles)
+    foreach ($p in $Profiles) {
+        $root = Join-Path $p.Path 'AppData\Roaming\Claude'
+        if (-not (Test-TLPath $root)) { continue }
+
+        $dc = Join-Path $root 'claude_desktop_config.json'
+        if (Test-TLPath $dc) {
+            try {
+                $fi = Get-Item -LiteralPath $dc -Force
+                $j  = Get-Content -LiteralPath $dc -Raw -ErrorAction Stop | ConvertFrom-Json
+                Add-TLEvent -Time $fi.LastWriteTimeUtc -Source 'ClaudeDesktop' -Category 'AI Config' -User $p.Name `
+                    -Description 'Claude Desktop configuration modified' `
+                    -Details ('Keys={0}' -f (($j.PSObject.Properties.Name) -join ',')) `
+                    -Artifact $dc -Confidence 'Medium - file mtime'
+                Add-TLAIMcpServers -Node $j.mcpServers -Source 'ClaudeDesktop' -User $p.Name -When $fi.LastWriteTimeUtc -Artifact $dc
+            } catch { Add-TLIssue 'AIAssistants' $dc $_.Exception.Message }
+        }
+
+        foreach ($sub in @('claude-code-sessions','local-agent-mode-sessions','logs','sentry')) {
+            $d = Join-Path $root $sub
+            if (-not (Test-TLPath $d)) { continue }
+            $files = @(Get-ChildItem -LiteralPath $d -Recurse -File -ErrorAction SilentlyContinue |
+                       Where-Object { $_.Extension -match '^\.(json|jsonl|log)$' } |
+                       Sort-Object LastWriteTime -Descending | Select-Object -First 300)
+            foreach ($f in $files) {
+                Add-TLEvent -Time $f.LastWriteTimeUtc -Source 'ClaudeDesktop' -Category 'AI Session' -User $p.Name `
+                    -Description ('Claude Desktop {0} file written: {1}' -f $sub, $f.Name) `
+                    -Details ('SizeBytes={0}; Created={1}' -f $f.Length, $f.CreationTimeUtc.ToString('yyyy-MM-dd HH:mm:ss')) `
+                    -Artifact $f.FullName -Confidence 'Medium - file mtime'
+            }
+        }
+        # Chromium-backed local storage is present but not parsed here.
+        foreach ($ls in @('Local Storage\leveldb','IndexedDB')) {
+            $d = Join-Path $root $ls
+            if (-not (Test-TLPath $d)) { continue }
+            try {
+                $fi = Get-Item -LiteralPath $d -Force
+                Add-TLEvent -Time $fi.LastWriteTimeUtc -Source 'ClaudeDesktop' -Category 'AI Session' -User $p.Name `
+                    -Description ('Claude Desktop {0} present (LevelDB - not parsed by this script)' -f $ls) `
+                    -Details 'Conversation fragments may persist here. Parse with a LevelDB-capable tool for full recovery.' `
+                    -Artifact $d -Confidence 'Info only'
+            } catch { }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Editor-integrated assistants (Cursor / VS Code Copilot Chat / Windsurf)
+# ---------------------------------------------------------------------------
+function Invoke-TLEditorAI {
+    param($Profiles)
+    $editors = @(
+        @{ N = 'Cursor';     P = 'AppData\Roaming\Cursor' },
+        @{ N = 'VSCode';     P = 'AppData\Roaming\Code' },
+        @{ N = 'VSCodeIns';  P = 'AppData\Roaming\Code - Insiders' },
+        @{ N = 'Windsurf';   P = 'AppData\Roaming\Windsurf' },
+        @{ N = 'VSCodium';   P = 'AppData\Roaming\VSCodium' }
+    )
+    $work = Join-Path $CaseDir 'artifacts\ai'
+    $null = New-Item -Path $work -ItemType Directory -Force -ErrorAction SilentlyContinue
+
+    foreach ($p in $Profiles) {
+        if (-not $p.Exists) { continue }
+        foreach ($e in $editors) {
+            $base = Join-Path $p.Path $e.P
+            if (-not (Test-TLPath $base)) { continue }
+
+            # state.vscdb holds Cursor's AI prompt/generation history (SQLite).
+            $dbs = @()
+            foreach ($rel in @('User\globalStorage\state.vscdb')) {
+                $d = Join-Path $base $rel
+                if (Test-TLPath $d) { $dbs += $d }
+            }
+            $ws = Join-Path $base 'User\workspaceStorage'
+            if (Test-TLPath $ws) {
+                $dbs += @(Get-ChildItem -LiteralPath $ws -Recurse -Filter 'state.vscdb' -File -ErrorAction SilentlyContinue |
+                          Sort-Object LastWriteTime -Descending | Select-Object -First 40 | ForEach-Object { $_.FullName })
+            }
+            foreach ($db in $dbs) {
+                $copy = Join-Path $work ('{0}_{1}_{2}.vscdb' -f $p.Name, $e.N, ([IO.Path]::GetFileName([IO.Path]::GetDirectoryName($db))))
+                if (-not (Copy-TLFile -Source $db -Destination $copy)) { continue }
+                try {
+                    $rows = Get-TLSqliteTable -Path $copy -Table 'ItemTable'
+                    $dbTime = (Get-Item -LiteralPath $db -Force).LastWriteTimeUtc
+                    foreach ($r in $rows) {
+                        $k = [string]$r['key']
+                        if ($k -notmatch '(?i)(aiService|chat|copilot|composer|cascade|aichat|prompt)') { continue }
+                        $val = $r['value']
+                        if ($val -is [byte[]]) { $val = [Text.Encoding]::UTF8.GetString($val) }
+                        $val = [string]$val
+                        if (-not $val) { continue }
+
+                        # Cursor: generations carry real per-entry timestamps.
+                        if ($k -match '(?i)aiService\.generations') {
+                            try {
+                                foreach ($g in @($val | ConvertFrom-Json)) {
+                                    $gt = ConvertFrom-TLJsonTime $g.unixMs
+                                    if (-not $gt) { continue }
+                                    Add-TLEvent -Time $gt -Source ('AI:' + $e.N) -Category 'AI Prompt' -User $p.Name `
+                                        -Description ('{0} AI generation: {1}' -f $e.N, (Protect-TLAIText ([string]$g.textDescription) 300)) `
+                                        -Details ('Type={0}; Uuid={1}' -f $g.type, $g.generationUUID) `
+                                        -Artifact $db -Confidence 'High'
+                                }
+                                continue
+                            } catch { }
+                        }
+                        if ($k -match '(?i)aiService\.prompts') {
+                            try {
+                                foreach ($g in @($val | ConvertFrom-Json)) {
+                                    if (-not $g.text) { continue }
+                                    Add-TLEvent -Time $dbTime -Source ('AI:' + $e.N) -Category 'AI Prompt' -User $p.Name `
+                                        -Description ('{0} AI prompt: {1}' -f $e.N, (Protect-TLAIText ([string]$g.text) 300)) `
+                                        -Details ('CommandType={0}. No per-entry timestamp; database mtime used.' -f $g.commandType) `
+                                        -Artifact $db -Confidence 'LOW - no per-entry timestamp'
+                                }
+                                continue
+                            } catch { }
+                        }
+                        Add-TLEvent -Time $dbTime -Source ('AI:' + $e.N) -Category 'AI Session' -User $p.Name `
+                            -Description ('{0} AI state key present: {1}' -f $e.N, (ConvertTo-TLText $k 160)) `
+                            -Details ('ValueChars={0}; Preview={1}' -f $val.Length, (Protect-TLAIText $val 300)) `
+                            -Artifact $db -Confidence 'LOW - database mtime'
+                    }
+                } catch { Add-TLIssue 'AIAssistants' $db $_.Exception.Message }
+            }
+
+            # VS Code / Copilot Chat session json files
+            if (Test-TLPath $ws) {
+                $cs = @(Get-ChildItem -LiteralPath $ws -Recurse -File -ErrorAction SilentlyContinue |
+                        Where-Object { $_.DirectoryName -match '(?i)(chatSessions|chatEditingSessions)' } |
+                        Sort-Object LastWriteTime -Descending | Select-Object -First 200)
+                foreach ($f in $cs) {
+                    Add-TLEvent -Time $f.LastWriteTimeUtc -Source ('AI:' + $e.N) -Category 'AI Session' -User $p.Name `
+                        -Description ('{0} chat session file written: {1}' -f $e.N, $f.Name) `
+                        -Details ('SizeBytes={0}; Folder={1}' -f $f.Length, (Split-Path $f.DirectoryName -Leaf)) `
+                        -Artifact $f.FullName -Confidence 'Medium - file mtime'
+                    Invoke-TLGenericAIJson -Path $f.FullName -Source ('AI:' + $e.N) -UserName $p.Name
+                }
+            }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Generic JSON / JSONL assistant session reader (Codex CLI, Continue, Gemini,
+# LM Studio, Copilot chat). Extracts anything that looks like a timestamped
+# turn; falls back to file metadata when the shape is unknown.
+# ---------------------------------------------------------------------------
+function Invoke-TLGenericAIJson {
+    param([string]$Path, [string]$Source, [string]$UserName)
+    try {
+        $fi = Get-Item -LiteralPath $Path -Force
+        if ($fi.Length -gt 40MB) { Add-TLIssue 'AIAssistants' $Path 'File larger than 40MB - skipped.'; return }
+        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+        if (-not $raw) { return }
+        $objs = @()
+        if ($Path -match '\.jsonl$') {
+            $n = 0
+            foreach ($line in ($raw -split "`r?`n")) {
+                if (-not $line.Trim()) { continue }
+                $n++
+                if ($n -gt $MaxAITranscriptLines) { break }
+                try { $objs += ($line | ConvertFrom-Json -ErrorAction Stop) } catch { }
+            }
+        } else {
+            try { $objs = @($raw | ConvertFrom-Json -ErrorAction Stop) } catch { return }
+        }
+        $emitted = 0
+        foreach ($o in $objs) {
+            foreach ($cand in @($o, $o.messages, $o.requests, $o.history, $o.turns, $o.conversation)) {
+                foreach ($m in @($cand)) {
+                    if ($null -eq $m -or $m -is [string]) { continue }
+                    $when = $null
+                    foreach ($tf in @('timestamp','createdAt','created_at','unixMs','time','date','ts')) {
+                        if ($m.$tf) { $when = ConvertFrom-TLJsonTime $m.$tf; if ($when) { break } }
+                    }
+                    if (-not $when) { continue }
+                    $role = ''
+                    foreach ($rf in @('role','type','sender','author')) { if ($m.$rf) { $role = [string]$m.$rf; break } }
+                    $txt = ''
+                    foreach ($cf in @('content','text','message','prompt','request','response')) {
+                        if ($m.$cf) { $txt = Get-TLAIContentText $m.$cf; if ($txt) { break } }
+                    }
+                    if (-not $txt) { continue }
+                    if ($emitted -ge $MaxAIEventsPerSession) { break }
+                    $emitted++
+                    $cat = if ($role -match '(?i)user|human|request') { 'AI Prompt' } else { 'AI Session' }
+                    Add-TLEvent -Time $when -Source $Source -Category $cat -User $UserName `
+                        -Description ('{0} [{1}]: {2}' -f $Source, $role, (Protect-TLAIText $txt 300)) `
+                        -Details ('Chars={0}; File={1}' -f $txt.Length, (Split-Path $Path -Leaf)) `
+                        -Artifact $Path -Confidence 'High'
+                    Add-TLAIRisk -When $when -Source $Source -User $UserName -What ('AI content in ' + (Split-Path $Path -Leaf)) `
+                        -Hits (Get-TLAIRiskHits $txt) -Detail (Protect-TLAIText $txt 300) -Artifact $Path
+                    foreach ($s in (Get-TLAISecretHits $txt)) {
+                        Add-TLEvent -Time $when -Source $Source -Category 'AI Risk' -User $UserName `
+                            -Description ('SECRET EXPOSURE in AI content ({0})' -f $s) `
+                            -Details 'Value deliberately not recorded. Rotate the credential.' `
+                            -Artifact $Path -Confidence 'REVIEW - possible secret disclosure'
+                    }
+                }
+            }
+        }
+    } catch { Add-TLIssue 'AIAssistants' $Path $_.Exception.Message }
+}
+
+# ---------------------------------------------------------------------------
+# CLI assistants and local model runners
+# ---------------------------------------------------------------------------
+function Invoke-TLOtherAI {
+    param($Profiles)
+    $specs = @(
+        @{ N='CodexCLI';  D='.codex\sessions';       F='*.jsonl'; Parse=$true  },
+        @{ N='CodexCLI';  D='.codex';                F='history.jsonl'; Parse=$true },
+        @{ N='Continue';  D='.continue\sessions';    F='*.json';  Parse=$true  },
+        @{ N='GeminiCLI'; D='.gemini\tmp';           F='*.json';  Parse=$true  },
+        @{ N='LMStudio';  D='.lmstudio\conversations'; F='*.json'; Parse=$true },
+        @{ N='Ollama';    D='.ollama';               F='history'; Parse=$false },
+        @{ N='Ollama';    D='.ollama\logs';          F='*.log';   Parse=$false },
+        @{ N='ChatGPTApp';D='AppData\Roaming\ChatGPT'; F='*.json'; Parse=$false },
+        @{ N='Copilot';   D='AppData\Roaming\Code\User\globalStorage\github.copilot-chat'; F='*.json'; Parse=$true }
+    )
+    foreach ($p in $Profiles) {
+        if (-not $p.Exists) { continue }
+        foreach ($s in $specs) {
+            $d = Join-Path $p.Path $s.D
+            if (-not (Test-TLPath $d)) { continue }
+            $files = @(Get-ChildItem -LiteralPath $d -Recurse -File -Filter $s.F -ErrorAction SilentlyContinue |
+                       Sort-Object LastWriteTime -Descending | Select-Object -First $MaxAISessionFiles)
+            if ($files.Count -eq 0) { continue }
+            Write-TLLog ("  {0}: {1} {2} file(s)" -f $p.Name, $files.Count, $s.N)
+            foreach ($f in $files) {
+                Add-TLEvent -Time $f.LastWriteTimeUtc -Source ('AI:' + $s.N) -Category 'AI Session' -User $p.Name `
+                    -Description ('{0} artefact written: {1}' -f $s.N, $f.Name) `
+                    -Details ('SizeBytes={0}; Created={1}' -f $f.Length, $f.CreationTimeUtc.ToString('yyyy-MM-dd HH:mm:ss')) `
+                    -Artifact $f.FullName -Confidence 'Medium - file mtime'
+                if ($s.Parse) { Invoke-TLGenericAIJson -Path $f.FullName -Source ('AI:' + $s.N) -UserName $p.Name }
+                elseif ($f.Name -eq 'history') {
+                    # Ollama CLI prompt history: newline separated, no timestamps.
+                    try {
+                        $lines = Get-Content -LiteralPath $f.FullName -ErrorAction Stop
+                        foreach ($l in $lines) {
+                            if (-not $l.Trim()) { continue }
+                            Add-TLEvent -Time $f.LastWriteTimeUtc -Source ('AI:' + $s.N) -Category 'AI Prompt' -User $p.Name `
+                                -Description ('Ollama prompt: {0}' -f (Protect-TLAIText $l 300)) `
+                                -Details 'Ollama history has no per-line timestamp; file mtime used.' `
+                                -Artifact $f.FullName -Confidence 'LOW - no per-line timestamp'
+                        }
+                    } catch { }
+                }
+            }
+        }
+    }
+
+    # aider keeps its history inside each project directory it was run in.
+    foreach ($dir in (Get-TLAIProjectDirs)) {
+        foreach ($fn in @('.aider.input.history','.aider.chat.history.md')) {
+            $f = Join-Path $dir $fn
+            if (-not (Test-TLPath $f)) { continue }
+            try {
+                $fi = Get-Item -LiteralPath $f -Force
+                Add-TLEvent -Time $fi.LastWriteTimeUtc -Source 'AI:aider' -Category 'AI Session' `
+                    -Description ('aider history present in {0}: {1}' -f $dir, $fn) `
+                    -Details ('SizeBytes={0}' -f $fi.Length) -Artifact $f -Confidence 'Medium - file mtime'
+                if ($fn -eq '.aider.input.history') {
+                    $cur = $null
+                    foreach ($l in (Get-Content -LiteralPath $f -ErrorAction Stop)) {
+                        if ($l -match '^#\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})') { $cur = ConvertFrom-TLJsonTime $Matches[1]; continue }
+                        if ($l -match '^\+(.+)$' -and $cur) {
+                            Add-TLEvent -Time $cur -Source 'AI:aider' -Category 'AI Prompt' `
+                                -Description ('aider prompt: {0}' -f (Protect-TLAIText $Matches[1] 300)) `
+                                -Details ('Project={0}' -f $dir) -Artifact $f -Confidence 'High'
+                        }
+                    }
+                }
+            } catch { Add-TLIssue 'AIAssistants' $f $_.Exception.Message }
+        }
+    }
+}
+
+function Get-TLAIProjectDirs {
+    # Directories where AI tooling is known to have run, derived from config and
+    # transcripts rather than by scanning the whole disk.
+    if ($script:AIProjectDirs) { return $script:AIProjectDirs }
+    $set = @{}
+    foreach ($s in $script:AISessions) { if ($s.Cwd -and (Test-TLPath $s.Cwd)) { $set[$s.Cwd] = 1 } }
+    foreach ($p in (Get-TLUserProfiles)) {
+        $cfg = Join-Path $p.Path '.claude.json'
+        if (-not (Test-TLPath $cfg)) { continue }
+        try {
+            $j = Get-Content -LiteralPath $cfg -Raw -ErrorAction Stop | ConvertFrom-Json
+            foreach ($pr in @($j.projects.PSObject.Properties)) { if (Test-TLPath $pr.Name) { $set[$pr.Name] = 1 } }
+        } catch { }
+    }
+    $script:AIProjectDirs = @($set.Keys)
+    return $script:AIProjectDirs
+}
+
+function Invoke-TLAIProjectConfigs {
+    # Project-scoped AI configuration: MCP definitions, agent instructions and
+    # rule files that steer an agent's behaviour.
+    foreach ($dir in (Get-TLAIProjectDirs)) {
+        foreach ($rel in @('.mcp.json','CLAUDE.md','AGENTS.md','.cursorrules','.windsurfrules',
+                           '.github\copilot-instructions.md','.claude\settings.json','.claude\settings.local.json')) {
+            $f = Join-Path $dir $rel
+            if (-not (Test-TLPath $f)) { continue }
+            try {
+                $fi = Get-Item -LiteralPath $f -Force
+                Add-TLEvent -Time $fi.LastWriteTimeUtc -Source 'AI:ProjectConfig' -Category 'AI Config' `
+                    -Description ('Project AI config modified: {0}' -f $f) `
+                    -Details ('SizeBytes={0}; Created={1}' -f $fi.Length, $fi.CreationTimeUtc.ToString('yyyy-MM-dd HH:mm:ss')) `
+                    -Artifact $f -Confidence 'Medium - file mtime'
+                if ($rel -eq '.mcp.json') {
+                    $j = Get-Content -LiteralPath $f -Raw -ErrorAction Stop | ConvertFrom-Json
+                    Add-TLAIMcpServers -Node $j.mcpServers -Source 'AI:ProjectConfig' -User '' -When $fi.LastWriteTimeUtc -Artifact $f
+                }
+            } catch { Add-TLIssue 'AIAssistants' $f $_.Exception.Message }
+        }
+    }
+}
+
+function Invoke-TLAIAssistants {
+    param($Profiles)
+    Write-TLLog 'Collecting AI assistant / LLM activity ...' 'STEP'
+    Import-TLRiskPatterns
+    Invoke-TLClaudeCode      -Profiles $Profiles
+    Invoke-TLClaudeDesktop   -Profiles $Profiles
+    Invoke-TLEditorAI        -Profiles $Profiles
+    Invoke-TLOtherAI         -Profiles $Profiles
+    Invoke-TLAIProjectConfigs
+    Write-TLLog ("  {0} AI session(s) reconstructed" -f $script:AISessions.Count)
+}
+
 function ConvertTo-TLHtmlText {
     param([string]$Text)
     if (-not $Text) { return '' }
@@ -2137,7 +2917,8 @@ function Export-TLHtml {
     [void]$sb.AppendLine('<!DOCTYPE html><html><head><meta charset="utf-8">')
     [void]$sb.AppendLine('<title>Device Timeline - ' + (ConvertTo-TLHtmlText $script:HostName) + '</title>')
     [void]$sb.AppendLine('<style>')
-    [void]$sb.AppendLine('*{box-sizing:border-box;}')
+    [void]$sb.AppendLine('*{box-sizing:border-box;} :root{color-scheme:dark;}')
+    [void]$sb.AppendLine('input[type=datetime-local]{width:196px;}')
     [void]$sb.AppendLine('body{font-family:Segoe UI,Arial,sans-serif;margin:0;padding:14px 16px;background:#11151c;color:#dfe6f0;}')
     [void]$sb.AppendLine('h1{font-size:19px;margin:0 0 3px 0;} .sub{color:#8fa0b8;font-size:12px;margin-bottom:10px;}')
     [void]$sb.AppendLine('.tabs{border-bottom:1px solid #2a3444;margin-bottom:10px;}')
@@ -2182,8 +2963,17 @@ function Export-TLHtml {
     [void]$sb.AppendLine('<select id="cat" onchange="apply()"><option value="">all categories</option></select>')
     [void]$sb.AppendLine('<select id="src" onchange="apply()"><option value="">all sources</option></select>')
     [void]$sb.AppendLine('<select id="cnf" onchange="apply()"><option value="">any confidence</option><option value="!">flagged / low confidence only</option></select>')
-    [void]$sb.AppendLine('<br><span class="lbl">from (UTC)</span><input id="from" size="17" placeholder="YYYY-MM-DD HH:MM" onchange="apply()">')
-    [void]$sb.AppendLine('<span class="lbl">to (UTC)</span><input id="to" size="17" placeholder="YYYY-MM-DD HH:MM" onchange="apply()">')
+    [void]$sb.AppendLine('<br><span class="lbl">quick range</span><select id="quick" onchange="qr()" title="Relative to the collection time, not to when you are reading this report.">')
+    [void]$sb.AppendLine('<option value="">custom / none</option>')
+    foreach ($qr in @(@{v='1';t='Last 1 hour'}, @{v='6';t='Last 6 hours'}, @{v='12';t='Last 12 hours'},
+                      @{v='24';t='Last 24 hours'}, @{v='48';t='Last 2 days'}, @{v='72';t='Last 3 days'},
+                      @{v='168';t='Last 7 days'}, @{v='336';t='Last 14 days'}, @{v='720';t='Last 30 days'},
+                      @{v='2160';t='Last 90 days'})) {
+        [void]$sb.AppendLine('<option value="' + $qr.v + '">' + $qr.t + '</option>')
+    }
+    [void]$sb.AppendLine('<option value="all">All time</option></select>')
+    [void]$sb.AppendLine('<span class="lbl">from (UTC)</span><input id="from" type="datetime-local" step="1" onchange="qclr();apply()">')
+    [void]$sb.AppendLine('<span class="lbl">to (UTC)</span><input id="to" type="datetime-local" step="1" onchange="qclr();apply()">')
     [void]$sb.AppendLine('<button onclick="clr()">Clear filters</button>')
     [void]$sb.AppendLine('<span class="lbl" id="cnt"></span></div>')
 
@@ -2215,7 +3005,9 @@ function Export-TLHtml {
 
     # ---- data payload: array of arrays keeps the file small and parse fast ----
     [void]$sb.AppendLine('<script>')
-    [void]$sb.AppendLine('var TOTAL=' + $total + ',EMBED=' + $embedded + ';')
+    $epochUtc = New-Object datetime(1970, 1, 1, 0, 0, 0, ([DateTimeKind]::Utc))
+    $collectedMs = [long](($script:StartedUtc - $epochUtc).TotalMilliseconds)
+    [void]$sb.AppendLine('var TOTAL=' + $total + ',EMBED=' + $embedded + ',COLLECTED=' + $collectedMs + ';')
     [void]$sb.Append('var DATA=[')
     $i = 0
     foreach ($r in $Rows) {
@@ -2247,6 +3039,16 @@ var CMAP={},BUCK=[],XS=0,XE=0,PX0=58,PXW=0;
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function pad(n){return n<10?'0'+n:''+n;}
 function fmt(ms){var d=new Date(ms);return d.getUTCFullYear()+'-'+pad(d.getUTCMonth()+1)+'-'+pad(d.getUTCDate())+' '+pad(d.getUTCHours())+':'+pad(d.getUTCMinutes())+':'+pad(d.getUTCSeconds());}
+function fmtIn(ms){return fmt(ms).replace(' ','T');}
+function qclr(){document.getElementById('quick').value='';}
+function qr(){
+ var v=document.getElementById('quick').value,f=document.getElementById('from'),t=document.getElementById('to');
+ if(v===''){return;}
+ if(v==='all'){f.value='';t.value='';apply();return;}
+ f.value=fmtIn(COLLECTED-(parseFloat(v)*36e5));
+ t.value='';
+ apply();
+}
 function pt(v,end){
  if(!v)return null;
  v=v.trim().replace(' ','T');
@@ -2295,7 +3097,7 @@ function pick(el,c){
 function deb(){clearTimeout(DEB);DEB=setTimeout(apply,160);}
 function clr(){
  ['q','from','to'].forEach(function(i){document.getElementById(i).value='';});
- ['cat','src','cnf'].forEach(function(i){document.getElementById(i).value='';});
+ ['cat','src','cnf','quick'].forEach(function(i){document.getElementById(i).value='';});
  var ch=document.getElementsByClassName('chip');
  for(var i=0;i<ch.length;i++)ch[i].className='chip';
  apply();
@@ -2361,6 +3163,7 @@ function render(){
 }
 function setView(v){
  VIEW=v;
+ document.getElementById('tip').style.display='none';
  document.getElementById('viewT').className=(v===1)?'':'hide';
  document.getElementById('viewG').className=(v===2)?'':'hide';
  document.getElementById('tabT').className=(v===1)?'tab on':'tab';
@@ -2480,9 +3283,9 @@ function move(ev){
 }
 function zoom(ev){
  var b=hit(ev);if(!b)return;
- document.getElementById('from').value=fmt(b.t0);
- document.getElementById('to').value=fmt(b.t1);
- apply();setView(1);
+ document.getElementById('from').value=fmtIn(b.t0);
+ document.getElementById('to').value=fmtIn(b.t1);
+ qclr();apply();setView(1);
 }
 document.getElementById('hist').addEventListener('mousemove',move);
 document.getElementById('hist').addEventListener('mouseleave',function(){document.getElementById('tip').style.display='none';});
@@ -2528,6 +3331,9 @@ function Export-TLResults {
     if ($script:Issues.Count -gt 0) {
         $script:Issues | Export-Csv -Path (Join-Path $CaseDir 'CollectionIssues.csv') -NoTypeInformation -Encoding UTF8
     }
+    if ($script:AISessions.Count -gt 0) {
+        $script:AISessions | Sort-Object StartUtc | Export-Csv -Path (Join-Path $CaseDir 'AISessions.csv') -NoTypeInformation -Encoding UTF8
+    }
 
     # Summary
     $sum = New-Object System.Text.StringBuilder
@@ -2557,6 +3363,27 @@ function Export-TLResults {
     $sorted | Group-Object Category | Sort-Object Count -Descending | ForEach-Object {
         [void]$sum.AppendLine(('{0,-52} {1,8}' -f $_.Name, $_.Count))
     }
+    if ($script:AISessions.Count -gt 0) {
+        [void]$sum.AppendLine('')
+        [void]$sum.AppendLine('AI ASSISTANT ACTIVITY')
+        [void]$sum.AppendLine('---------------------')
+        [void]$sum.AppendLine(('Sessions reconstructed : {0}' -f $script:AISessions.Count))
+        $tp = ($script:AISessions | Measure-Object -Property Prompts -Sum).Sum
+        $tc = ($script:AISessions | Measure-Object -Property ToolCalls -Sum).Sum
+        [void]$sum.AppendLine(('Operator prompts       : {0}' -f $tp))
+        [void]$sum.AppendLine(('Agent tool calls       : {0}' -f $tc))
+        $risky = @($script:AISessions | Where-Object { $_.RiskHits })
+        $secs  = @($script:AISessions | Where-Object { $_.SecretHits -gt 0 })
+        [void]$sum.AppendLine(('Sessions w/ risk hits  : {0}' -f $risky.Count))
+        [void]$sum.AppendLine(('Sessions w/ secrets    : {0}' -f $secs.Count))
+        [void]$sum.AppendLine('')
+        foreach ($s in ($script:AISessions | Sort-Object StartUtc)) {
+            [void]$sum.AppendLine(('  {0}  {1,-12} {2,-14} prompts={3,-4} tools={4,-5} {5}' -f `
+                $s.StartUtc, $s.Tool, $s.User, $s.Prompts, $s.ToolCalls, $s.Cwd))
+            if ($s.RiskHits)          { [void]$sum.AppendLine('      RISK   : ' + $s.RiskHits) }
+            if ($s.SecretHits -gt 0)  { [void]$sum.AppendLine('      SECRETS: ' + $s.SecretHits + ' credential-shaped value(s) in prompt text - rotate them') }
+        }
+    }
     [void]$sum.AppendLine('')
     [void]$sum.AppendLine('INTERPRETATION NOTES')
     [void]$sum.AppendLine('--------------------')
@@ -2569,6 +3396,12 @@ function Export-TLResults {
     [void]$sum.AppendLine('* Registry MRU timestamps apply to the whole key, i.e. the most recent entry only.')
     [void]$sum.AppendLine('* See EventLogCoverage.csv for how far back each event log actually reaches.')
     [void]$sum.AppendLine('* See CollectionIssues.csv for artefacts that could not be read.')
+    [void]$sum.AppendLine('* AI agent tool calls executed commands that never reach PSReadLine history -')
+    [void]$sum.AppendLine('  treat "AI Tool Call" rows as execution evidence in their own right.')
+    [void]$sum.AppendLine('* "AI Risk" rows are heuristic pattern matches for triage, not proof of misuse.')
+    [void]$sum.AppendLine('* AI transcripts may contain secrets pasted by the operator. Secret VALUES are')
+    [void]$sum.AppendLine('  never written to this output, only the pattern name - but the source .jsonl')
+    [void]$sum.AppendLine('  files on disk still contain them. Handle the case folder accordingly.')
     $sumPath = Join-Path $CaseDir 'Summary.txt'
     [System.IO.File]::WriteAllText($sumPath, $sum.ToString(), (New-Object System.Text.UTF8Encoding($false)))
 
@@ -2613,6 +3446,7 @@ try {
     if (Test-TLModule 'USB')            { Invoke-TLUSB }
     if (Test-TLModule 'Persistence')    { Invoke-TLPersistence    -Profiles $profiles }
     if (Test-TLModule 'Accounts')       { Invoke-TLAccounts }
+    if (Test-TLModule 'AIAssistants')   { Invoke-TLAIAssistants   -Profiles $profiles }
 
     $csv = Export-TLResults
     Write-TLLog ("Collection complete. Output: {0}" -f $CaseDir) 'STEP'
